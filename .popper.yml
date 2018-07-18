@@ -12,6 +12,7 @@ pipelines:
     - setup
     - test-default
     - test-init
+    - test-require
     - test-existing
     - test-run
     - test-ci

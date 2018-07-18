@@ -39,8 +39,15 @@ from collections import defaultdict
          'only when no pipeline argument is provided ',
     required=False,
 )
+@click.option('--requirement-level',
+              type=click.Choice(['warn', 'ignore', 'fail']), default='fail',
+              help='Determines how to handle missing requirements. warn simply'
+                   'emits a wanring and continues normally; ignore runs the'
+                   'specified pipelines despite missing unfulfilled'
+                   'requirements; fail exits with an error on unfilfilled'
+                   'requirements')
 @pass_context
-def cli(ctx, pipeline, timeout, skip, ignore_errors):
+def cli(ctx, pipeline, timeout, skip, requirement_level, ignore_errors):
     """Executes a pipeline and reports its status. When PIPELINE is given, it
     executes only the pipeline with such a name. If the argument is omitted,
     all pipelines are executed in lexicographical order. Reports an error if
@@ -50,6 +57,9 @@ def cli(ctx, pipeline, timeout, skip, ignore_errors):
     pipes = pu.read_config()['pipelines']
     project_root = pu.get_project_root()
     time_out = pu.parse_timeout(timeout)
+
+    reqs_missing = False
+    status = None
 
     if len(pipes) == 0:
         pu.info("No pipelines defined in .popper.yml. "
@@ -117,14 +127,21 @@ def cli(ctx, pipeline, timeout, skip, ignore_errors):
                     "argument is provided")
         if pipeline not in pipes:
             pu.fail("Cannot find pipeline {} in .popper.yml".format(pipeline))
-        skipped = skip.split(',') if skip is not None else []
-        status = run_pipeline(project_root, pipes[pipeline], time_out, skipped)
+        if validate_requirements(pipeline, pipes[pipeline], requirement_level):
+            skipped = skip.split(',') if skip is not None else []
+            status = run_pipeline(project_root, pipes[pipeline],
+                                  time_out, skipped)
     else:
         if os.path.basename(cwd) in pipes:
             # run just the one for CWD
-            skipped = skip.split(',') if skip is not None else []
-            status = run_pipeline(project_root, pipes[os.path.basename(cwd)],
-                                  time_out, skipped)
+            pipeline = os.path.basename(cwd)
+            if validate_requirements(pipeline, pipes[pipeline],
+                                     requirement_level):
+                skipped = skip.split(',') if skip is not None else []
+                status = run_pipeline(project_root, pipes[pipeline],
+                                      time_out, skipped)
+            else:
+                reqs_missing = True
         else:
             # run all
             skip_list = skip.split(',') if skip else []
@@ -137,7 +154,9 @@ def cli(ctx, pipeline, timeout, skip, ignore_errors):
                     skipped_stages[pipe].append(stage)
 
             for pipe in pipes:
-                if pipe not in skip_list:
+                reqs_fullfilled = validate_requirements(pipe, pipes[pipe],
+                                                        requirement_level)
+                if pipe not in skip_list and reqs_fullfilled:
                     status = run_pipeline(
                         project_root,
                         pipes[pipe],
@@ -147,12 +166,14 @@ def cli(ctx, pipeline, timeout, skip, ignore_errors):
 
                     if status == 'FAIL' and not ignore_errors:
                         break
+                if not reqs_fullfilled:
+                    reqs_missing = True
 
     os.chdir(cwd)
 
     remote_url = pu.get_remote_url()
 
-    if remote_url and os.environ.get('CI', False):
+    if not reqs_missing and remote_url and os.environ.get('CI', False):
         baseurl = pu.read_config().get(
             'badge-server-url', 'http://badges.falsifiable.us'
         )
@@ -174,8 +195,28 @@ def cli(ctx, pipeline, timeout, skip, ignore_errors):
         except subprocess.CalledProcessError:
             pu.warn("No commit log found")
 
-    if status == 'FAIL':
+    if status is not None and status == 'FAIL':
         pu.fail("Failed to execute pipeline")
+
+
+def validate_requirements(pipe_name, pipe_config, requirement_level):
+    if 'requirements' not in pipe_config:
+        return True
+
+    reqs = pipe_config['requirements'].get('vars', [])
+    missing_reqs = [envvar for envvar in reqs if envvar not in os.environ]
+
+    if len(missing_reqs):
+        msg = ('Required environment variables for pipeline {} unset: {}'
+               .format(pipe_name, ','.join(missing_reqs)))
+
+        if requirement_level == 'fail':
+            pu.fail(msg)
+
+        pu.info(msg)
+
+        return requirement_level == 'ignore'
+    return True
 
 
 def run_pipeline(project_root, pipeline, timeout, skipped):
